@@ -1,0 +1,755 @@
+# ═══════════════════════════════════════════════════
+# 日语变形词汇听力练习  v4.0
+# 离线变形库 — 一次生成，永久使用
+# Streamlit + edge_tts + GitHub Gist
+# ═══════════════════════════════════════════════════
+import streamlit as st
+import edge_tts
+import asyncio, io, random, datetime, json, requests
+
+st.set_page_config(
+    page_title="日语变形听力", page_icon="🇯🇵",
+    layout="centered", initial_sidebar_state="collapsed",
+)
+st.markdown("""
+<style>
+  .word-box {
+      text-align:center; font-size:56px; font-weight:700;
+      letter-spacing:4px; padding:16px 0 10px; line-height:1.15;
+  }
+  .word-box.hidden { filter:blur(14px); user-select:none; }
+  .form-tag {
+      display:inline-block; padding:3px 14px; border-radius:20px;
+      background:#e8f4fd; color:#1a6fa8; font-size:13px; font-weight:600;
+  }
+  .meaning-row {
+      border-left:3px solid #5ba4d4; padding:6px 10px;
+      margin:4px 0; font-size:14px; background:#f7fbff; border-radius:0 6px 6px 0;
+  }
+  .cov-ok  { color:#2e7d32; font-weight:600; }
+  .cov-no  { color:#c62828; }
+  div.stButton > button { border-radius:10px; }
+  audio { width:100% !important; }
+</style>
+""", unsafe_allow_html=True)
+
+# ─── 语音 & 速度 ──────────────────────────────────
+VOICES = {
+    "🎀 七海 Nanami（女）": "ja-JP-NanamiNeural",
+    "🎵 圭太 Keita（男）":  "ja-JP-KeitaNeural",
+}
+SPEEDS = {
+    "🐢 0.75×":"-25%","🐇 0.9×":"-10%",
+    "▶ 1.0×":"+0%","⚡ 1.15×":"+15%","🚀 1.3×":"+30%",
+}
+
+# ─── 变形类型 ─────────────────────────────────────
+VERB_FORMS = [
+    {"id":"te",        "label":"て形",     "weight":3},
+    {"id":"past",      "label":"た形",     "weight":3},
+    {"id":"nai",       "label":"ない形",   "weight":3},
+    {"id":"masu",      "label":"ます形",   "weight":3},
+    {"id":"potential", "label":"可能形",   "weight":1},
+    {"id":"passive",   "label":"被動形",   "weight":1},
+    {"id":"causative", "label":"使役形",   "weight":1},
+    {"id":"ba",        "label":"ば条件形", "weight":1},
+]
+ADJ_FORMS = [
+    {"id":"adj_neg",  "label":"否定形",   "weight":2},
+    {"id":"adj_past", "label":"過去形",   "weight":2},
+    {"id":"adj_adv",  "label":"副詞形",   "weight":1},
+    {"id":"adj_te",   "label":"て形連接", "weight":1},
+]
+ALL_FORMS  = VERB_FORMS + ADJ_FORMS
+FORM_BY_ID = {f["id"]:f for f in ALL_FORMS}
+
+VERB_KEYS  = {"一段","五段","カ変","サ変","动词","動詞"}
+ADJ_KEYS   = {"い形","な形","形容"}
+GIST_WORDS = "jp_words.csv"
+GIST_CONJ  = "jp_conj.json"
+BATCH_SIZE = 50
+
+
+# ─── 工具 ─────────────────────────────────────────
+def _is_verb(t): return any(k in (t or "") for k in VERB_KEYS)
+def _is_adj(t):  return any(k in (t or "") for k in ADJ_KEYS)
+
+def applicable_forms(word_entry, enabled_verb, enabled_adj):
+    wtype=(word_entry.get("type") or "").strip()
+    if _is_verb(wtype):
+        return [f for f in VERB_FORMS if f["id"] in enabled_verb]
+    elif _is_adj(wtype):
+        return [f for f in ADJ_FORMS  if f["id"] in enabled_adj]
+    else:
+        return ([f for f in VERB_FORMS if f["id"] in enabled_verb] +
+                [f for f in ADJ_FORMS  if f["id"] in enabled_adj])
+
+
+# ═══════════════════════════════════════════════════
+# WordStore
+# ═══════════════════════════════════════════════════
+class WordStore:
+    def __init__(self): self.words=[]
+    def _exists(self): return {w["word"] for w in self.words}
+    def _next_grp(self,gs=33): return (len(self.words)//gs)+1
+    def _entry(self,word,reading="",wtype="",meaning_zh="",group=None,level=0,gs=33):
+        return {"word":word,"reading":reading,"type":wtype,"meaning_zh":meaning_zh,
+                "group":group or self._next_grp(gs),"long_level":max(0,min(3,level)),
+                "added_date":datetime.date.today().isoformat()}
+    def add_text(self,text,gs=33):
+        ex=self._exists(); added=0
+        for line in text.splitlines():
+            w=line.strip()
+            if w and w not in ex:
+                self.words.append(self._entry(w,gs=gs)); ex.add(w); added+=1
+        return added
+    def import_csv(self,text,gs=33):
+        ex=self._exists(); added=0
+        for line in text.splitlines():
+            line=line.strip()
+            if not line or line.lower().startswith("word"): continue
+            p=[x.strip() for x in line.split(",")]
+            word=p[0]
+            if not word or word in ex: continue
+            try:   group=int(p[4]) if len(p)>4 and p[4] else None
+            except: group=None
+            try:   level=int(p[5]) if len(p)>5 and p[5] else 0
+            except: level=0
+            self.words.append(self._entry(word,
+                p[1] if len(p)>1 else "",p[2] if len(p)>2 else "",
+                p[3] if len(p)>3 else "",group,level,gs))
+            ex.add(word); added+=1
+        return added
+    def export_csv(self):
+        lines=["word,reading,type,meaning_zh,group,long_level,added_date"]
+        for w in self.words:
+            lines.append(",".join([w["word"],w.get("reading",""),w.get("type",""),
+                w.get("meaning_zh",""),str(w["group"]),str(w["long_level"]),
+                w.get("added_date","")]))
+        return "\n".join(lines)
+    def update_long(self,word,level):
+        for w in self.words:
+            if w["word"]==word: w["long_level"]=level; break
+    def filter(self,levels,groups):
+        return [w for w in self.words
+                if w["long_level"] in levels and w["group"] in groups]
+    def get(self,word):
+        for w in self.words:
+            if w["word"]==word: return w
+        return None
+
+
+# ═══════════════════════════════════════════════════
+# ConjStore  —  变形库
+# key = "word::form_id"
+# ═══════════════════════════════════════════════════
+class ConjStore:
+    def __init__(self): self.data={}
+    def key(self,word,form_id): return f"{word}::{form_id}"
+    def has(self,word,form_id): return self.key(word,form_id) in self.data
+    def get(self,word,form_id): return self.data.get(self.key(word,form_id))
+    def add(self,word,form_id,conjugated,reading,meanings):
+        self.data[self.key(word,form_id)]={"conjugated":conjugated,
+                                            "reading":reading,"meanings":meanings}
+    def export_json(self):
+        return json.dumps(self.data,ensure_ascii=False,indent=2)
+    def import_json(self,text):
+        d=json.loads(text); added=0
+        for k,v in d.items():
+            if k not in self.data: self.data[k]=v; added+=1
+        return added
+    def merge_ai_result(self,json_text):
+        text=json_text.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
+        data=json.loads(text)
+        ok=0; skip=0
+        for item in data:
+            if item.get("error") or not item.get("conjugated"):
+                skip+=1; continue
+            word=item.get("word",""); form_id=item.get("form_id","")
+            if not word or not form_id: skip+=1; continue
+            self.add(word,form_id,item["conjugated"],
+                     item.get("reading",""),item.get("meanings",[]))
+            ok+=1
+        return ok,skip
+    def coverage(self,words,enabled_verb,enabled_adj):
+        fc={f["id"]:0 for f in ALL_FORMS}
+        ft={f["id"]:0 for f in ALL_FORMS}
+        missing=[]
+        for w in words:
+            for f in applicable_forms(w,enabled_verb,enabled_adj):
+                ft[f["id"]]=ft.get(f["id"],0)+1
+                if self.has(w["word"],f["id"]):
+                    fc[f["id"]]=fc.get(f["id"],0)+1
+                else:
+                    missing.append((w,f))
+        return fc,ft,missing
+    def build_practice_items(self,words,enabled_verb,enabled_adj):
+        items=[]
+        for w in words:
+            for f in applicable_forms(w,enabled_verb,enabled_adj):
+                c=self.get(w["word"],f["id"])
+                if c:
+                    items.append({"word":w["word"],"reading":w.get("reading",""),
+                        "type":w.get("type",""),"meaning_zh":w.get("meaning_zh",""),
+                        "form_id":f["id"],"form_label":f["label"],"form_weight":f["weight"],
+                        "conjugated":c["conjugated"],"conj_reading":c["reading"],
+                        "meanings":c["meanings"]})
+        return items
+
+
+# ═══════════════════════════════════════════════════
+# 提示词生成
+# ═══════════════════════════════════════════════════
+def make_prompt(batch):
+    lines=[]
+    for w,f in batch:
+        r=w.get("reading","") or "—"
+        tp=w.get("type","")   or "未知"
+        lines.append(f"{w['word']} | {r} | {tp} | {f['label']} | {f['id']}")
+    word_table="\n".join(lines)
+    return f"""你是日语语法教师助手。请将下列词汇按指定变形类型变形，返回 JSON 数组。
+只返回 JSON，不要任何解释或 markdown 符号（不要 ``` ）。
+
+每个元素格式：
+{{
+  "word": "原词基本形（原样返回）",
+  "form_id": "变形ID（原样返回）",
+  "conjugated": "变形后的词",
+  "reading": "变形后完整读法（全平假名）",
+  "meanings": [
+    "「使用场景」：中文说明（15字以内）",
+    "「使用场景」：中文说明"
+  ]
+}}
+
+meanings：列出 2～4 条该变形最典型用法，每条注明场景（连续动作/请求/原因/条件/否定等）用中文。
+若该词类完全不支持此变形，加 "error":"不支持" 字段，conjugated 留空。
+
+---
+词汇列表（原词 | 读法 | 词类 | 变形类型 | form_id）：
+{word_table}
+---
+
+请返回包含以上全部 {len(batch)} 个词的 JSON 数组："""
+
+
+# ═══════════════════════════════════════════════════
+# PracticeSession
+# ═══════════════════════════════════════════════════
+class PracticeSession:
+    def __init__(self,items):
+        self.items=items; self.total=len(items); self.passed=set()
+        weights=[it["form_weight"] for it in items]
+        pop=list(range(self.total))
+        self.queue=random.choices(pop,weights=weights,k=self.total*2)
+        self.q_pos=0
+    def _advance(self):
+        while self.q_pos<len(self.queue):
+            if self.queue[self.q_pos] not in self.passed: return
+            self.q_pos+=1
+        undone=[i for i in range(self.total) if i not in self.passed]
+        if not undone: return
+        weights=[self.items[i]["form_weight"] for i in undone]
+        self.queue.extend(random.choices(undone,weights=weights,k=len(undone)*2))
+    def current(self):
+        self._advance()
+        if self.q_pos>=len(self.queue): return None,-1
+        idx=self.queue[self.q_pos]
+        return self.items[idx],idx
+    def rate(self,lv):
+        _,idx=self.current()
+        if idx<0: return "done"
+        if lv==1: self.passed.add(idx)
+        else:
+            ins=self.q_pos+1+(3 if lv==2 else 1)
+            self.queue.insert(min(ins,len(self.queue)),idx)
+        self.q_pos+=1
+        if len(self.passed)==self.total: return "done"
+        return "ok"
+    def prev(self):
+        if self.q_pos>0: self.q_pos-=1; return True
+        return False
+    def stats(self):
+        return {"done":len(self.passed),"total":self.total,
+                "queue_rem":max(0,len(self.queue)-self.q_pos)}
+
+
+# ═══════════════════════════════════════════════════
+# GitHub Gist
+# ═══════════════════════════════════════════════════
+def _gist_cfg():
+    try:
+        t=st.secrets["github"]["token"]
+        g=st.secrets["github"].get("gist_id","")
+        return t,g or None
+    except: return None,None
+
+def _gist_enabled(): return bool(_gist_cfg()[0])
+
+def _gh(method,url,**kw):
+    t,_=_gist_cfg()
+    return requests.request(method,url,timeout=15,
+        headers={"Authorization":f"token {t}",
+                 "Accept":"application/vnd.github+json"},**kw)
+
+def _gist_find():
+    p=1
+    while True:
+        items=_gh("GET","https://api.github.com/gists",
+                  params={"per_page":100,"page":p}).json()
+        if not items: return None
+        for i in items:
+            if GIST_WORDS in i.get("files",{}): return i["id"]
+        p+=1
+
+def _raw(gist_data,filename):
+    f=gist_data.get("files",{}).get(filename)
+    if not f: return None
+    return requests.get(f["raw_url"],timeout=15).text
+
+def do_gist_load():
+    _,gid=_gist_cfg()
+    with st.spinner("☁️ 从 GitHub Gist 加载…"):
+        try:
+            gid=gid or _gist_find()
+            if not gid: st.warning("未找到 Gist，请先保存一次"); return
+            gist=_gh("GET",f"https://api.github.com/gists/{gid}").json()
+            words_csv=_raw(gist,GIST_WORDS)
+            conj_json=_raw(gist,GIST_CONJ)
+        except Exception as e: st.error(f"加载失败：{e}"); return
+    n_w=st.session_state.store.import_csv(words_csv) if words_csv else 0
+    n_c=st.session_state.conj_store.import_json(conj_json) if conj_json else 0
+    st.session_state.gist_id=gid
+    st.session_state.gist_last_sync=datetime.datetime.now().strftime("%H:%M:%S")
+    st.success(f"✅ 词库 +{n_w} 词 / 变形库 +{n_c} 条"); st.rerun()
+
+def do_gist_save():
+    store=st.session_state.store; cs=st.session_state.conj_store
+    if not store.words: st.warning("词库为空"); return
+    _,cfg_gid=_gist_cfg(); gid=st.session_state.get("gist_id") or cfg_gid
+    with st.spinner("☁️ 保存到 GitHub Gist…"):
+        try:
+            gid=gid or _gist_find()
+            payload={"description":"日语变形听力练习数据",
+                     "files":{GIST_WORDS:{"content":store.export_csv()},
+                              GIST_CONJ: {"content":cs.export_json()}}}
+            if gid:
+                new_id=_gh("PATCH",f"https://api.github.com/gists/{gid}",json=payload).json()["id"]
+            else:
+                payload["public"]=False
+                new_id=_gh("POST","https://api.github.com/gists",json=payload).json()["id"]
+        except Exception as e: st.error(f"保存失败：{e}"); return
+    st.session_state.gist_id=new_id
+    st.session_state.gist_last_sync=datetime.datetime.now().strftime("%H:%M:%S")
+    st.success(f"✅ 已保存（词库 {len(store.words)} 词 / 变形库 {len(cs.data)} 条）")
+    if not gid: st.info(f"新建 Gist ID：`{new_id}`")
+
+
+# ═══════════════════════════════════════════════════
+# 音频
+# ═══════════════════════════════════════════════════
+def get_audio(text,voice,rate="+0%"):
+    async def _gen():
+        comm=edge_tts.Communicate(text,voice,rate=rate)
+        buf=io.BytesIO()
+        async for chunk in comm.stream():
+            if chunk["type"]=="audio": buf.write(chunk["data"])
+        buf.seek(0); return buf.read()
+    try: return asyncio.new_event_loop().run_until_complete(_gen())
+    except: return None
+
+
+# ═══════════════════════════════════════════════════
+# session_state 初始化
+# ═══════════════════════════════════════════════════
+def _init():
+    defaults={
+        "phase":"main","store":WordStore(),"conj_store":ConjStore(),
+        "session":None,"voice":"ja-JP-NanamiNeural","speed":"+0%",
+        "gist_id":None,"gist_last_sync":None,
+        "cur_audio":None,"last_audio_key":"","autoplay":False,"show_answer":False,
+        "last_imported_file":"",
+        "enabled_verb":{"te","past","nai","masu","potential","passive","causative","ba"},
+        "enabled_adj":{"adj_neg","adj_past","adj_adv","adj_te"},
+        "gen_batches":[],"gen_batch_idx":0,
+    }
+    for k,v in defaults.items():
+        if k not in st.session_state: st.session_state[k]=v
+
+_init()
+
+
+# ═══════════════════════════════════════════════════
+# 主页
+# ═══════════════════════════════════════════════════
+def screen_main():
+    store=st.session_state.store
+    cs=st.session_state.conj_store
+    ev=st.session_state.enabled_verb
+    ea=st.session_state.enabled_adj
+
+    st.title("🇯🇵 日语变形听力练习")
+
+    # Gist
+    with st.expander("☁️ GitHub Gist 同步",expanded=False):
+        if _gist_enabled():
+            c1,c2=st.columns(2)
+            with c1:
+                if st.button("📥 从 Gist 加载",use_container_width=True): do_gist_load()
+            with c2:
+                if st.button("📤 保存到 Gist",use_container_width=True): do_gist_save()
+            if st.session_state.gist_last_sync:
+                st.caption(f"上次同步：{st.session_state.gist_last_sync}")
+        else:
+            st.caption("在 secrets.toml 配置 `[github] token` 后可使用云同步")
+
+    # 词库
+    with st.expander("📚 词库管理",expanded=not bool(store.words)):
+        st.caption("CSV：`word,reading,type,meaning_zh`（后三列可省略，AI 会判断词类）")
+        tab_csv,tab_txt=st.tabs(["上传 CSV","粘贴纯文本"])
+        with tab_csv:
+            f=st.file_uploader("CSV",type="csv",label_visibility="collapsed")
+            if f is not None:
+                fkey=f"{f.name}_{f.size}"
+                if fkey!=st.session_state.get("last_imported_file"):
+                    n=store.import_csv(f.read().decode("utf-8"))
+                    st.session_state.last_imported_file=fkey
+                    st.success(f"✅ 导入 {n} 个词"); st.rerun()
+        with tab_txt:
+            txt=st.text_area("每行一个基本形",height=100,label_visibility="collapsed")
+            if st.button("添加",use_container_width=True):
+                n=store.add_text(txt); st.success(f"✅ 添加 {n} 个词"); st.rerun()
+        if store.words:
+            c1,c2=st.columns(2)
+            with c1:
+                st.download_button("⬇ 下载词库",data=store.export_csv(),
+                    file_name="jp_words.csv",mime="text/csv",use_container_width=True)
+            with c2:
+                if st.button("🗑 清空词库",use_container_width=True):
+                    st.session_state.store=WordStore(); st.rerun()
+
+    if not store.words:
+        st.info("👆 请先导入词库"); return
+
+    st.markdown(f"词库共 **{len(store.words)}** 个词")
+
+    # 变形类型设置（在覆盖率之前，因为覆盖率依赖它）
+    with st.expander("⚙️ 变形类型设置",expanded=False):
+        st.caption("**动词变形**（★★★=主要权重×3，★=次要权重×1）")
+        ev2=set(ev)
+        cols=st.columns(4)
+        for i,f in enumerate(VERB_FORMS):
+            star="★★★" if f["weight"]==3 else "★"
+            if cols[i%4].checkbox(f"{star} {f['label']}",value=f["id"] in ev2,key=f"vf_{f['id']}"):
+                ev2.add(f["id"])
+            else: ev2.discard(f["id"])
+        st.session_state.enabled_verb=ev2 or {"te"}
+
+        st.caption("**形容词变形**")
+        ea2=set(ea)
+        cols2=st.columns(4)
+        for i,f in enumerate(ADJ_FORMS):
+            if cols2[i%4].checkbox(f["label"],value=f["id"] in ea2,key=f"af_{f['id']}"):
+                ea2.add(f["id"])
+            else: ea2.discard(f["id"])
+        st.session_state.enabled_adj=ea2 or {"adj_neg"}
+        ev=st.session_state.enabled_verb
+        ea=st.session_state.enabled_adj
+
+    # 覆盖率
+    with st.expander("📊 变形库覆盖率",expanded=True):
+        fc,ft,missing=cs.coverage(store.words,ev,ea)
+        total_pairs=sum(ft.values())
+        total_have =sum(fc.values())
+        pct=int(100*total_have/total_pairs) if total_pairs else 0
+        st.progress(pct/100,
+            text=f"整体覆盖 {total_have} / {total_pairs} 条（{pct}%）")
+
+        cols=st.columns(4)
+        ci=0
+        for f in ALL_FORMS:
+            fid=f["id"]
+            if ft.get(fid,0)==0: continue
+            have=fc.get(fid,0); need=ft[fid]
+            cls="cov-ok" if have==need else "cov-no"
+            cols[ci%4].markdown(
+                f"<span class='{cls}'>{f['label']}</span><br><small>{have}/{need}</small>",
+                unsafe_allow_html=True)
+            ci+=1
+
+        st.divider()
+        if missing:
+            st.warning(f"⚠️ 还有 **{len(missing)}** 个词×变形 缺少数据 "
+                       f"（约需 {-(-len(missing)//BATCH_SIZE)} 批提示词）")
+            c1,c2=st.columns(2)
+            with c1:
+                if st.button("📝 生成补全提示词",type="primary",use_container_width=True):
+                    batches=[]
+                    for i in range(0,len(missing),BATCH_SIZE):
+                        b=missing[i:i+BATCH_SIZE]
+                        batches.append((i//BATCH_SIZE+1,make_prompt(b),b))
+                    st.session_state.gen_batches=batches
+                    st.session_state.gen_batch_idx=0
+                    st.session_state.phase="gen"; st.rerun()
+            with c2:
+                # 导入已有 JSON（手动上传）
+                conj_file=st.file_uploader("或上传变形库 JSON",
+                    type="json",label_visibility="collapsed",key="conj_upload")
+                if conj_file:
+                    fkey2=f"conj_{conj_file.name}_{conj_file.size}"
+                    if fkey2!=st.session_state.get("last_conj_file"):
+                        n=cs.import_json(conj_file.read().decode("utf-8"))
+                        st.session_state.last_conj_file=fkey2
+                        st.success(f"✅ 导入变形库 {n} 条"); st.rerun()
+        else:
+            st.success("✅ 所有变形数据均已就绪！")
+
+        if cs.data:
+            st.download_button("⬇ 下载变形库 JSON",data=cs.export_json(),
+                file_name="jp_conj.json",mime="application/json",
+                use_container_width=True)
+
+    st.divider()
+
+    # 筛选 & 开始
+    groups={}
+    for w in store.words: groups.setdefault(w["group"],[]).append(w)
+    lv_map={0:"0 新词",1:"1 已掌握",2:"2 模糊",3:"3 重点"}
+    lv_sel=st.multiselect("长期等级",options=[0,1,2,3],default=[0,2,3],
+                          format_func=lambda x:lv_map[x])
+    gr_sel=st.multiselect("分组",options=sorted(groups),default=sorted(groups),
+        format_func=lambda x:f"第 {x} 组（{len(groups[x])} 词）",
+        label_visibility="collapsed")
+
+    ws=store.filter(lv_sel,gr_sel)
+    items=cs.build_practice_items(ws,ev,ea)
+    voice_name=st.selectbox("语音",list(VOICES.keys()))
+
+    if items:
+        st.info(f"🎯 **{len(ws)}** 词 / **{len(items)}** 个变形条目")
+    elif ws:
+        st.warning("⚠️ 筛选词还没有变形数据，请先生成提示词")
+    else:
+        st.warning("⚠️ 无词匹配，请调整筛选条件")
+
+    if st.button("🎧 开始练习",type="primary",
+                 disabled=(not items),use_container_width=True):
+        st.session_state.voice=VOICES[voice_name]
+        st.session_state.session=PracticeSession(items)
+        st.session_state.show_answer=False
+        st.session_state.last_audio_key=""
+        st.session_state.phase="session"; st.rerun()
+
+
+# ═══════════════════════════════════════════════════
+# 提示词生成器
+# ═══════════════════════════════════════════════════
+def screen_gen():
+    batches=st.session_state.gen_batches
+    if not batches: st.session_state.phase="main"; st.rerun(); return
+
+    total=len(batches)
+    bidx=st.session_state.gen_batch_idx
+    batch_no,prompt,missing_list=batches[bidx]
+
+    st.title("📝 批量生成变形数据")
+
+    # 总体进度条
+    done_batches=sum(1 for b in batches[:bidx])
+    st.progress(done_batches/total,
+        text=f"进度：{done_batches}/{total} 批已完成")
+
+    # 批次导航
+    cols=st.columns(len(batches) if len(batches)<=10 else 10)
+    for i,(bn,_,ml) in enumerate(batches[:10]):
+        label=f"{'✅' if i<bidx else ('▶' if i==bidx else '○')} {bn}"
+        if cols[i].button(label,key=f"bsel_{i}",use_container_width=True):
+            st.session_state.gen_batch_idx=i; st.rerun()
+    if len(batches)>10:
+        st.caption(f"共 {total} 批，仅显示前10个导航")
+
+    st.markdown(f"#### 第 {batch_no} 批 — {len(missing_list)} 个词×变形")
+    st.divider()
+
+    # 步骤 1
+    st.markdown("**① 复制提示词** → 粘贴给 AI（Claude / ChatGPT 均可）")
+    st.text_area("提示词",value=prompt,height=280,
+                 key=f"pt_{bidx}",label_visibility="collapsed")
+
+    st.divider()
+
+    # 步骤 2
+    st.markdown("**② 将 AI 返回的 JSON 粘贴到这里**")
+    ai_result=st.text_area("AI 结果",height=220,
+        placeholder='[\n  {"word":"食べる","form_id":"te","conjugated":"食べて",...},\n  ...\n]',
+        key=f"res_{bidx}",label_visibility="collapsed")
+
+    if st.button("✅ 合并到变形库",type="primary",use_container_width=True):
+        if not ai_result.strip():
+            st.warning("请先粘贴 AI 返回的 JSON")
+        else:
+            try:
+                ok,skip=st.session_state.conj_store.merge_ai_result(ai_result)
+                st.success(f"✅ 合并 {ok} 条，跳过 {skip} 条（不支持/格式错误）")
+                if bidx+1<total:
+                    st.session_state.gen_batch_idx=bidx+1; st.rerun()
+                else:
+                    st.balloons(); st.success("🎉 所有批次完成！")
+                    if _gist_enabled(): do_gist_save()
+                    st.session_state.gen_batches=[]
+                    st.session_state.gen_batch_idx=0
+                    st.session_state.phase="main"; st.rerun()
+            except Exception as e:
+                st.error(f"JSON 解析失败：{e}\n\n请确认 AI 返回的是纯 JSON 数组")
+
+    st.divider()
+    c1,c2,c3=st.columns(3)
+    with c1:
+        if bidx>0:
+            if st.button("◀ 上一批",use_container_width=True):
+                st.session_state.gen_batch_idx=bidx-1; st.rerun()
+    with c2:
+        if bidx+1<total:
+            if st.button("跳过 ▶",use_container_width=True):
+                st.session_state.gen_batch_idx=bidx+1; st.rerun()
+    with c3:
+        if st.button("⏹ 退出",use_container_width=True):
+            st.session_state.phase="main"
+            st.session_state.gen_batches=[]; st.rerun()
+
+
+# ═══════════════════════════════════════════════════
+# 练习界面
+# ═══════════════════════════════════════════════════
+def screen_session():
+    sess=st.session_state.session
+    if not sess: st.session_state.phase="main"; st.rerun(); return
+
+    item,idx=sess.current()
+    if item is None: st.session_state.phase="done"; st.rerun(); return
+
+    audio_key=f"{item['word']}::{item['form_id']}"
+    if st.session_state.last_audio_key!=audio_key:
+        with st.spinner("🎵 生成音频…"):
+            st.session_state.cur_audio=get_audio(
+                item["conjugated"],st.session_state.voice,st.session_state.speed)
+        st.session_state.last_audio_key=audio_key
+        st.session_state.show_answer=False
+        st.session_state.autoplay=True
+
+    s=sess.stats()
+    st.caption(f"已通过 **{s['done']}/{s['total']}** · 队列剩余 {s['queue_rem']}")
+    st.progress(s["done"]/max(s["total"],1))
+
+    st.markdown(
+        f"<div style='text-align:center;margin-bottom:6px'>"
+        f"<span class='form-tag'>{item['form_label']}</span></div>",
+        unsafe_allow_html=True)
+
+    show=st.session_state.get("show_answer",False)
+    cls="" if show else " hidden"
+    st.markdown(f"<div class='word-box{cls}'>{item['conjugated']}</div>",
+                unsafe_allow_html=True)
+
+    autoplay=st.session_state.get("autoplay",False)
+    st.session_state.autoplay=False
+    if st.session_state.cur_audio:
+        st.audio(st.session_state.cur_audio,format="audio/mpeg",autoplay=autoplay)
+
+    col_spd,col_rp=st.columns([4,1])
+    with col_spd:
+        spd_name=st.selectbox("速度",list(SPEEDS.keys()),
+            index=list(SPEEDS.values()).index(st.session_state.speed),
+            label_visibility="collapsed")
+        st.session_state.speed=SPEEDS[spd_name]
+    with col_rp:
+        if st.button("🔊",use_container_width=True):
+            st.session_state.autoplay=True; st.rerun()
+
+    st.divider()
+
+    if st.toggle("👁 显示答案",value=show,key="show_answer"):
+        c1,c2=st.columns(2)
+        with c1:
+            st.markdown("**基本形**")
+            st.markdown(f"#### {item['word']}")
+            if item.get("reading"):    st.caption(f"読み：{item['reading']}")
+            if item.get("meaning_zh"): st.caption(f"🈶 {item['meaning_zh']}")
+            if item.get("type"):       st.caption(f"词类：{item['type']}")
+        with c2:
+            st.markdown(f"**{item['form_label']}**")
+            st.markdown(f"#### {item['conjugated']}")
+            if item.get("conj_reading"): st.caption(f"読み：{item['conj_reading']}")
+        if item.get("meanings"):
+            st.markdown("**变形用法**")
+            for m in item["meanings"]:
+                st.markdown(f"<div class='meaning-row'>・{m}</div>",
+                            unsafe_allow_html=True)
+
+    st.divider()
+    st.caption("评级 → 自动跳下一词")
+
+    def do_rate(lv):
+        r=sess.rate(lv)
+        st.session_state.last_audio_key=""
+        if r=="done": st.session_state.phase="done"
+        st.rerun()
+
+    b1,b2,b3=st.columns(3)
+    with b1:
+        if st.button("① 听懂了",use_container_width=True,type="secondary"): do_rate(1)
+    with b2:
+        if st.button("② 不确定",use_container_width=True): do_rate(2)
+    with b3:
+        if st.button("③ 没听懂",use_container_width=True,type="primary"): do_rate(3)
+
+    n1,_,n3=st.columns(3)
+    with n1:
+        if st.button("◀ 上一",use_container_width=True):
+            if sess.prev(): st.session_state.last_audio_key=""; st.rerun()
+    with n3:
+        if st.button("⏹ 退出",use_container_width=True):
+            st.session_state.phase="main"; st.session_state.session=None; st.rerun()
+
+    we=st.session_state.store.get(item["word"]) or {}
+    cur_lv=we.get("long_level",0) if isinstance(we,dict) else 0
+    lv_names={0:"0 新词",1:"1 掌握",2:"2 模糊",3:"3 重点"}
+    with st.expander(f"长期标记（当前 {cur_lv} 级）"):
+        cols=st.columns(4)
+        for lv,col in zip([0,1,2,3],cols):
+            bt="primary" if lv==cur_lv else "secondary"
+            if col.button(lv_names[lv],key=f"ll_{lv}",use_container_width=True,type=bt):
+                st.session_state.store.update_long(item["word"],lv)
+                st.toast(f"✅ 标记为 {lv} 级"); st.rerun()
+
+
+# ═══════════════════════════════════════════════════
+# 完成
+# ═══════════════════════════════════════════════════
+def screen_done():
+    sess=st.session_state.session
+    if not sess: st.session_state.phase="main"; st.rerun(); return
+    s=sess.stats()
+    st.balloons()
+    st.success(f"🎉 练习完成！{s['total']} 个变形条目全部通过 ✓")
+    c1,c2=st.columns(2)
+    with c1:
+        if _gist_enabled():
+            if st.button("🐙 保存到 Gist",type="primary",use_container_width=True):
+                do_gist_save()
+    with c2:
+        st.download_button("⬇ 下载词库",data=st.session_state.store.export_csv(),
+            file_name="jp_words.csv",mime="text/csv",use_container_width=True)
+    if st.button("🏠 返回主页",use_container_width=True):
+        st.session_state.phase="main"; st.session_state.session=None; st.rerun()
+
+
+# ═══════════════════════════════════════════════════
+# 路由
+# ═══════════════════════════════════════════════════
+{
+    "main":    screen_main,
+    "gen":     screen_gen,
+    "session": screen_session,
+    "done":    screen_done,
+}.get(st.session_state.phase, screen_main)()
