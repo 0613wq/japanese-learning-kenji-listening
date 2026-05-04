@@ -1086,7 +1086,7 @@ def screen_session():
         lc1, lc2, lc3, lc4 = st.columns(4)
         for lv, col in zip([0, 1, 2, 3], [lc1, lc2, lc3, lc4]):
             btn_type = "primary" if lv == cur_lv else "secondary"
-            if col.button(lv_map[lv], key=f"long_{lv}",
+            if col.button(lv_map[lv], key=f"long_{lv}_{word}",
                           use_container_width=True, type=btn_type):
                 st.session_state.store.update_long(word, lv)
                 st.toast(f"✅ 已保存为长期 {lv} 级")
