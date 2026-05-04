@@ -266,6 +266,12 @@ class WordStore:
             added += 1
         return added
 
+    def get_long(self, word):
+        for w in self.words:
+            if w['word'] == word:
+                return w['long_level']
+        return 0
+
     def update_long(self, word, level):
         for w in self.words:
             if w['word'] == word:
@@ -318,24 +324,11 @@ class WordStore:
 # ═══════════════════════════════════════════════════
 # SessionManager
 # ═══════════════════════════════════════════════════
-# ─── 短期状态初始值 ───────────────────────────────────────
-# 新词/模糊词 → 模糊(2)入场；重点词 → 不会(3)入场；已掌握 → 直接通过
-_INIT_STATE = {0: 2, 1: 2, 2: 2, 3: 2}
-
-# ─── 回溯位置 ─────────────────────────────────────────────
-# 不会(3)：中位×1   → 来一次，看能否认识变成模糊
-# 模糊(2)：后位×1   → 再来一次，这次认识就过了
-# （两者合起来就是"从不会到认识走两步：中位+后位"）
-_REAPPEAR = {
-    3: [('medium', 10, 17)],
-    2: [('far',    22, 35)],
-    1: [],
-}
-
-# ─── 跨组携带槽数 ─────────────────────────────────────────
+_INIT_STATE    = {0: 3, 1: 1, 2: 2, 3: 3}
+_REAPPEAR      = {3: [('near', 4, 8), ('medium', 14, 22)], 2: [('medium', 10, 17)], 1: []}
+# 跨组携带：state 2/3 的词都带入下一组
 _CARRYOVER_SLOTS = {3: 2, 2: 1}
-
-# ─── 累计③达到此值 → 立刻登记进下一组（本组继续练）───────
+# 累计失败次数达到此阈值 → 标记为"卡词"（提醒用户注意）
 FAIL_THRESHOLD = 3
 
 class SessionManager:
@@ -343,11 +336,12 @@ class SessionManager:
         self.ordered   = ordered
         self.word_map  = {w['word']: w for w in words}
         self.state     = {w['word']: _INIT_STATE[w['long_level']] for w in words}
-        self.done      = {w['word']: False for w in words}
+        self.done      = {w['word']: (w['long_level'] == 1) for w in words}
+        # dgr: 短期"升难计数"（连续难 → 升级）
+        self.dgr       = {w['word']: {} for w in words}
+        # fail_cnt: 累计③评级次数（跨越整个 session 不清零）
         self.fail_cnt  = {w['word']: 0 for w in words}
         self.history   = {w['word']: [] for w in words}
-        # 第3次选③时立刻登记，带入下一组（本组继续练）
-        self.next_group_carry = {}
         gmap = {}
         for w in words:
             gmap.setdefault(w['group'], []).append(w['word'])
@@ -369,10 +363,7 @@ class SessionManager:
         combined = list(main)
         for w, slots in self.carryover.items():
             for _ in range(slots):
-                # 携带词插入中后部分，不塞在最前面
-                lo  = len(combined) // 3
-                pos = random.randint(lo, len(combined))
-                combined.insert(pos, w)
+                combined.insert(random.randint(0, len(combined)), w)
         self.carryover = {}
         self.queue = combined
         self.q_pos = 0
@@ -382,34 +373,31 @@ class SessionManager:
 
     def _reinsert(self, word):
         for (_, lo, hi) in _REAPPEAR.get(self.state[word], []):
-            dist = max(2, random.randint(lo, hi))
+            dist = max(3, random.randint(lo, hi))
             pos  = min(self.q_pos + dist, len(self.queue))
             self.queue.insert(pos, word)
 
     def rate(self, word, button):
         self.history[word].append(button)
-        curr = self.state[word]
-
-        # ── 状态转换：即时、每次一格 ──────────────────────────
-        if button < curr:
-            self.state[word] = curr - 1   # 向认识方向一格
-        elif button > curr:
-            self.state[word] = curr + 1   # 向不会方向一格（最多3）
-        # button == curr：状态不变
-
-        # ── 累计③ & 立刻登记下一组（本组继续练）─────────────
+        # 累计失败计数（③ = 听不出来）
         if button == 3:
             self.fail_cnt[word] = self.fail_cnt.get(word, 0) + 1
-            if self.fail_cnt[word] == FAIL_THRESHOLD and not self.in_loop:
-                self.next_group_carry[word] = _CARRYOVER_SLOTS.get(3, 2)
-
-        # ── 完成判定 & 回溯 ───────────────────────────────────
+        curr = self.state[word]
+        if button < curr:
+            self.state[word] = button
+            self.dgr[word]   = {}
+        elif button > curr:
+            self.dgr[word][button] = self.dgr[word].get(button, 0) + 1
+            if self.dgr[word][button] >= 3:
+                self.state[word] = min(3, curr + 1)
+                self.dgr[word]   = {}
+        else:
+            self.dgr[word] = {}
         if self.state[word] == 1:
             self.done[word] = True
         else:
             self.done[word] = False
             self._reinsert(word)
-
         self.q_pos += 1
         if self.is_done():
             return 'session_done'
@@ -431,16 +419,12 @@ class SessionManager:
         self.last_carryover = []
         for w in self.gmap[gid]:
             st_val = self.state[w]
-            if not self.done[w] and st_val in _CARRYOVER_SLOTS:
-                new_carry[w] = _CARRYOVER_SLOTS[st_val]
-                self.last_carryover.append(w)
-        # 合并"立刻登记"的词（第3次选③时触发，本组未练完也带走）
-        for w, slots in self.next_group_carry.items():
-            if w not in new_carry:
+            # 跨组携带：state 2/3 的词 OR 累计失败≥阈值的词
+            if not self.done[w] and (st_val in _CARRYOVER_SLOTS or
+                                     self.fail_cnt.get(w, 0) >= FAIL_THRESHOLD):
+                slots = _CARRYOVER_SLOTS.get(st_val, 1)
                 new_carry[w] = slots
-                if w not in self.last_carryover:
-                    self.last_carryover.append(w)
-        self.next_group_carry = {}
+                self.last_carryover.append(w)
         self.g_idx += 1
         if self.g_idx < len(self.group_order):
             self.carryover = new_carry
@@ -483,25 +467,27 @@ class SessionManager:
         return self.group_order[self.g_idx]
 
     def word_detail(self, word):
-        return {
-            'state':    self.state.get(word, 1),
-            'hist':     self.history.get(word, []),
-            'fail_cnt': self.fail_cnt.get(word, 0),
-            'next_grp': word in self.next_group_carry,   # 已登记进下一组
-        }
+        return {'state':    self.state.get(word, 1),
+                'hist':     self.history.get(word, []),
+                'dgr_cnt':  sum(self.dgr.get(word, {}).values()),
+                'fail_cnt': self.fail_cnt.get(word, 0)}
 
     def stats(self):
         done  = sum(1 for d in self.done.values() if d)
         total = len(self.done)
+        stuck = sum(1 for w in self.fail_cnt
+                    if self.fail_cnt[w] >= FAIL_THRESHOLD)
         return {'done': done, 'total': total,
                 'undone_count': total - done,
                 'queue_rem':    max(0, len(self.queue) - self.q_pos),
                 'in_loop':      self.in_loop,
                 'gid':          self.current_gid(),
-                'next_grp_cnt': len(self.next_group_carry)}
+                'stuck':        stuck}
 
     def stuck_words(self):
-        return [w for w in self.fail_cnt if self.fail_cnt[w] >= FAIL_THRESHOLD]
+        """返回累计失败≥阈值的词列表"""
+        return [w for w in self.fail_cnt
+                if self.fail_cnt[w] >= FAIL_THRESHOLD]
 
 
 
@@ -993,14 +979,15 @@ def screen_session():
     gstr = f"第 {s['gid']} 组" if s['gid'] else "🔁 收尾循环"
 
     fail_tip = ""
-    if det['next_grp']:
-        fail_tip = f" · ⚠️ →下组（③×{det['fail_cnt']}）"
+    if det['fail_cnt'] >= FAIL_THRESHOLD:
+        fail_tip = f" · ⚠️ 卡词（共③ {det['fail_cnt']} 次）"
     elif det['fail_cnt'] > 0:
         fail_tip = f" · ③×{det['fail_cnt']}"
+    dgr_tip = f" · 升难 {det['dgr_cnt']}/3" if det['dgr_cnt'] else ""
     st.caption(
         f"**{gstr}** · 队列剩余 {s['queue_rem']} · "
         f"已通过 {s['done']}/{s['total']} · "
-        f"{_sl[det['state']]}{fail_tip}"
+        f"{_sl[det['state']]}{dgr_tip}{fail_tip}"
     )
     st.progress(s['done'] / max(s['total'], 1))
 
@@ -1080,15 +1067,16 @@ def screen_session():
             st.session_state.session = None
             st.rerun()
 
-    cur_lv = sess.word_map[word]['long_level']
+    cur_lv = st.session_state.store.get_long(word)
     with st.expander(f"长期评级（当前 {cur_lv} 级）"):
         lv_map = {0: "0 新词", 1: "1 掌握", 2: "2 模糊", 3: "3 重点"}
         lc1, lc2, lc3, lc4 = st.columns(4)
         for lv, col in zip([0, 1, 2, 3], [lc1, lc2, lc3, lc4]):
             btn_type = "primary" if lv == cur_lv else "secondary"
-            if col.button(lv_map[lv], key=f"long_{lv}_{word}",
+            if col.button(lv_map[lv], key=f"long_{word}_{lv}",
                           use_container_width=True, type=btn_type):
                 st.session_state.store.update_long(word, lv)
+                sess.word_map[word]['long_level'] = lv
                 st.toast(f"✅ 已保存为长期 {lv} 级")
                 st.rerun()
 
