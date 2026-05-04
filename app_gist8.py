@@ -320,7 +320,7 @@ class WordStore:
 # ═══════════════════════════════════════════════════
 # ─── 短期状态初始值 ───────────────────────────────────────
 # 新词/模糊词 → 模糊(2)入场；重点词 → 不会(3)入场；已掌握 → 直接通过
-_INIT_STATE = {0: 2, 1: 1, 2: 2, 3: 3}
+_INIT_STATE = {0: 2, 1: 2, 2: 2, 3: 2}
 
 # ─── 回溯位置 ─────────────────────────────────────────────
 # 不会(3)：中位×1   → 来一次，看能否认识变成模糊
@@ -343,7 +343,7 @@ class SessionManager:
         self.ordered   = ordered
         self.word_map  = {w['word']: w for w in words}
         self.state     = {w['word']: _INIT_STATE[w['long_level']] for w in words}
-        self.done      = {w['word']: (w['long_level'] == 1) for w in words}
+        self.done      = {w['word']: False for w in words}
         self.fail_cnt  = {w['word']: 0 for w in words}
         self.history   = {w['word']: [] for w in words}
         # 第3次选③时立刻登记，带入下一组（本组继续练）
